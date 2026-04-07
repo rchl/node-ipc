@@ -59,6 +59,17 @@ class NodeIPCProcess:
             None,   # non-inheritable
         )
 
+        # Put server into listening state before client connects
+        # Use overlapped ConnectNamedPipe so it doesn't block — the client
+        # CreateFile below will complete the connection synchronously.
+        connect_overlapped = pywintypes.OVERLAPPED()
+        connect_overlapped.hEvent = win32event.CreateEvent(None, True, False, None)
+        try:
+            win32pipe.ConnectNamedPipe(self._server_handle, connect_overlapped)
+        except pywintypes.error as e:
+            if e.winerror != 997:   # ERROR_IO_PENDING is expected
+                raise
+
         # Client end — also overlapped (libuv requirement), non-inheritable first
         client_handle = win32file.CreateFile(
             pipe_name,
@@ -80,6 +91,9 @@ class NodeIPCProcess:
             2,      # DUPLICATE_SAME_ACCESS
         )
         win32file.CloseHandle(client_handle)
+
+        # Wait for ConnectNamedPipe to complete now that client has connected
+        win32event.WaitForSingleObject(connect_overlapped.hEvent, win32event.INFINITE)
 
         # Pass the raw Win32 HANDLE value — on Windows Node resolves NODE_CHANNEL_FD
         # via OpenProcess/DuplicateHandle internally; it expects a handle integer,
