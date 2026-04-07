@@ -126,11 +126,14 @@ class NodeIPCProcess:
         overlapped.hEvent = win32event.CreateEvent(None, True, False, None)
         with self._lock:
             try:
-                win32file.WriteFile(self._server_handle, payload, overlapped)
+                rc, _ = win32file.WriteFile(self._server_handle, payload, overlapped)
+                if rc != 0:  # not synchronously complete — wait
+                    win32event.WaitForSingleObject(overlapped.hEvent, win32event.INFINITE)
             except pywintypes.error as e:
-                if e.winerror != 997:
+                if e.winerror == 997:   # ERROR_IO_PENDING
+                    win32event.WaitForSingleObject(overlapped.hEvent, win32event.INFINITE)
+                else:
                     raise
-            win32event.WaitForSingleObject(overlapped.hEvent, win32event.INFINITE)
 
     def on_message(self, handler: Callable[[dict], None]):
         self._message_handlers.append(handler)
@@ -150,20 +153,29 @@ class NodeIPCProcess:
                 read_buf = bytearray(PIPE_BUFFER)
                 overlapped = pywintypes.OVERLAPPED()
                 overlapped.hEvent = win32event.CreateEvent(None, True, False, None)
+                n = None
                 try:
-                    win32file.ReadFile(self._server_handle, read_buf, overlapped)
+                    rc, _ = win32file.ReadFile(self._server_handle, read_buf, overlapped)
+                    # rc == 0 means synchronous completion — data is already in read_buf
+                    if rc == 0:
+                        n = win32file.GetOverlappedResult(self._server_handle, overlapped, False)
                 except pywintypes.error as e:
-                    if e.winerror != 997:
-                        if e.winerror in (109, 232):
-                            break
-                        raise
-                win32event.WaitForSingleObject(overlapped.hEvent, win32event.INFINITE)
-                try:
-                    n = win32file.GetOverlappedResult(self._server_handle, overlapped, False)
-                except pywintypes.error as e:
-                    if e.winerror in (109, 232):
+                    if e.winerror == 997:   # ERROR_IO_PENDING — genuinely async
+                        win32event.WaitForSingleObject(overlapped.hEvent, win32event.INFINITE)
+                        try:
+                            n = win32file.GetOverlappedResult(
+                                self._server_handle, overlapped, False
+                            )
+                        except pywintypes.error as e2:
+                            if e2.winerror in (109, 232):
+                                break
+                            raise
+                    elif e.winerror in (109, 232):
                         break
-                    raise
+                    else:
+                        raise
+                if n is None or n == 0:
+                    continue
                 buf += bytes(read_buf[:n])
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
@@ -192,7 +204,7 @@ if __name__ == "__main__":
         print(f"[Python] ← Node: {msg}")
         received.append(msg)
 
-    proc = NodeIPCProcess("debug.js").on_message(on_msg).start()
+    proc = NodeIPCProcess("child.js").on_message(on_msg).start()
 
     time.sleep(0.3)
 
