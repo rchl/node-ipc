@@ -2,15 +2,12 @@
 Python parent process that communicates with a Node.js child process
 using Node's native IPC channel on Windows.
 
-Named pipe flow:
-  - Python creates a named pipe and opens both ends.
-  - The client end is DuplicateHandle'd into an inheritable copy.
-  - That copy is wrapped in a CRT fd whose number goes into NODE_CHANNEL_FD.
-  - Python retains the server end for its own reads/writes.
-  - After Popen, Python closes the inheritable duplicate (child has its own copy).
+libuv (Node's I/O layer) opens named pipes with FILE_FLAG_OVERLAPPED.
+Windows requires BOTH ends of a pipe to agree on overlapped vs sync mode,
+so the server end must also be created with FILE_FLAG_OVERLAPPED.
+We use overlapped ReadFile/WriteFile with win32event objects on the Python side.
 """
 
-import ctypes
 import json
 import msvcrt
 import os
@@ -24,12 +21,11 @@ from typing import final
 
 import pywintypes
 import win32api
-import win32con
+import win32event
 import win32file
 import win32pipe
 
 PIPE_BUFFER = 65536
-INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
 
 @final
@@ -39,7 +35,7 @@ class NodeIPCProcess:
         self.script_path = script_path
         self.args = args or []
         self._proc = None
-        self._server_handle = None   # parent's end of the pipe (non-inheritable)
+        self._server_handle = None
         self._message_handlers: list[Callable[[dict[str, object]], None]] = []
         self._reader_thread = None
         self._lock = threading.Lock()
@@ -52,43 +48,41 @@ class NodeIPCProcess:
         pipe_name = f"\\\\.\\pipe\\node-ipc-{uuid.uuid4().hex}"
         cur_proc = win32api.GetCurrentProcess()
 
-        # --- server end (parent keeps this, non-inheritable) ---
+        # Server end — FILE_FLAG_OVERLAPPED is required to match libuv's client end
         self._server_handle = win32pipe.CreateNamedPipe(
             pipe_name,
-            win32pipe.PIPE_ACCESS_DUPLEX,
+            win32pipe.PIPE_ACCESS_DUPLEX | win32file.FILE_FLAG_OVERLAPPED,
             win32pipe.PIPE_TYPE_BYTE | win32pipe.PIPE_READMODE_BYTE | win32pipe.PIPE_WAIT,
             1,
             PIPE_BUFFER,
             PIPE_BUFFER,
             0,
-            None,   # default security — not inheritable
+            None,   # non-inheritable
         )
 
-        # --- client end (will be handed to Node) ---
-        # Open without inheritance first, then duplicate into an inheritable copy.
+        # Client end — also overlapped (libuv requirement), non-inheritable first
         client_handle = win32file.CreateFile(
             pipe_name,
             win32file.GENERIC_READ | win32file.GENERIC_WRITE,
             0,
-            None,               # not inheritable yet
+            None,
             win32file.OPEN_EXISTING,
             win32file.FILE_FLAG_OVERLAPPED,
             None,
         )
 
-        # DuplicateHandle → inheritable copy for the child
+        # Duplicate into an inheritable handle for the child process
         inheritable_client = win32api.DuplicateHandle(
-            cur_proc,           # source process
-            client_handle,      # handle to duplicate
-            cur_proc,           # target process (still us — Popen will inherit it)
-            0,                  # desired access (ignored when DUPLICATE_SAME_ACCESS)
-            True,               # bInheritHandle
-            win32con.DUPLICATE_SAME_ACCESS,
+            cur_proc,
+            client_handle,
+            cur_proc,
+            0,
+            True,   # bInheritHandle
+            2,      # DUPLICATE_SAME_ACCESS
         )
-        win32file.CloseHandle(client_handle)  # original non-inheritable copy no longer needed
+        win32file.CloseHandle(client_handle)
 
-        # Wrap the inheritable Win32 handle in a CRT fd.
-        # msvcrt.open_osfhandle takes ownership — do NOT close inheritable_client separately.
+        # Wrap the inheritable handle as a CRT fd — Node reads NODE_CHANNEL_FD as int
         child_fd = msvcrt.open_osfhandle(
             inheritable_client.handle,
             os.O_RDWR | os.O_BINARY,
@@ -104,11 +98,10 @@ class NodeIPCProcess:
             stdout=sys.stdout,
             stderr=sys.stderr,
             env=env,
-            close_fds=False,    # allow fd inheritance on Windows
+            close_fds=False,
         )
 
-        # Now that the child has inherited the fd, close our copy.
-        # os.close releases the CRT fd and its underlying Win32 handle.
+        # Child has inherited its copy — close ours
         os.close(child_fd)
 
         self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
@@ -131,8 +124,15 @@ class NodeIPCProcess:
     def send(self, message: dict):
         """Send a JSON message to the Node child (process.on('message', …))."""
         payload = (json.dumps(message) + "\n").encode()
+        overlapped = pywintypes.OVERLAPPED()
+        overlapped.hEvent = win32event.CreateEvent(None, True, False, None)
         with self._lock:
-            win32file.WriteFile(self._server_handle, payload)
+            try:
+                win32file.WriteFile(self._server_handle, payload, overlapped)
+            except pywintypes.error as e:
+                if e.winerror != 997:   # ERROR_IO_PENDING is expected for overlapped I/O
+                    raise
+            win32event.WaitForSingleObject(overlapped.hEvent, win32event.INFINITE)
 
     def on_message(self, handler: Callable[[dict], None]):
         self._message_handlers.append(handler)
@@ -149,12 +149,26 @@ class NodeIPCProcess:
         buf = b""
         try:
             while True:
+                overlapped = pywintypes.OVERLAPPED()
+                overlapped.hEvent = win32event.CreateEvent(None, True, False, None)
                 try:
-                    _, data = win32file.ReadFile(self._server_handle, PIPE_BUFFER)
+                    _, data = win32file.ReadFile(self._server_handle, PIPE_BUFFER, overlapped)
                 except pywintypes.error as e:
-                    if e.winerror == 109:   # ERROR_BROKEN_PIPE — Node exited cleanly
+                    if e.winerror == 997:   # ERROR_IO_PENDING
+                        win32event.WaitForSingleObject(overlapped.hEvent, win32event.INFINITE)
+                        try:
+                            nbytes = win32file.GetOverlappedResult(
+                                self._server_handle, overlapped, False
+                            )
+                            data = win32file.ReadFile(self._server_handle, nbytes)[1]
+                        except pywintypes.error as e2:
+                            if e2.winerror in (109, 232):   # broken pipe / pipe closing
+                                break
+                            raise
+                    elif e.winerror in (109, 232):
                         break
-                    raise
+                    else:
+                        raise
 
                 buf += data
                 while b"\n" in buf:
