@@ -1,14 +1,19 @@
 """
 Python parent process that communicates with a Node.js child process
-using Node's native IPC channel on Windows (named pipe + newline-delimited JSON).
+using Node's native IPC channel on Windows.
+
+Node on Windows still expects NODE_CHANNEL_FD to be a numeric CRT fd,
+not a pipe name. We create a named pipe, obtain a CRT fd from its Win32
+handle via msvcrt.open_osfhandle, and pass that fd number to the child.
 """
 
 import json
-import time
+import msvcrt
 import os
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from typing import final
@@ -16,6 +21,7 @@ from typing import final
 import pywintypes
 import win32file
 import win32pipe
+import win32security
 
 PIPE_BUFFER = 65536
 
@@ -27,8 +33,9 @@ class NodeIPCProcess:
         self.script_path = script_path
         self.args = args or []
         self._proc = None
-        self._pipe_handle = None
-        self._pipe_name = None
+        self._pipe_handle = None       # parent's Win32 handle (read/write)
+        self._child_handle = None      # child's inheritable Win32 handle
+        self._child_fd = None          # CRT fd number passed to Node
         self._message_handlers: list[Callable[[dict[str, object]], None]] = []
         self._reader_thread = None
         self._lock = threading.Lock()
@@ -38,25 +45,44 @@ class NodeIPCProcess:
     # ------------------------------------------------------------------
 
     def start(self):
-        # Unique named pipe — Node expects \\.\pipe\<name>
-        self._pipe_name = f"\\\\.\\pipe\\node-ipc-{uuid.uuid4().hex}"
+        pipe_name = f"\\\\.\\pipe\\node-ipc-{uuid.uuid4().hex}"
 
-        sa = pywintypes.SECURITY_ATTRIBUTES()
-        # Create the named pipe (server side, Python is the server)
+        # Security attributes — mark the child-side handle as inheritable
+        sa = win32security.SECURITY_ATTRIBUTES()
+        sa.bInheritHandle = True
+
+        # Create the named pipe server (parent side, non-inheritable)
         self._pipe_handle = win32pipe.CreateNamedPipe(
-            self._pipe_name,
+            pipe_name,
             win32pipe.PIPE_ACCESS_DUPLEX,
             win32pipe.PIPE_TYPE_BYTE | win32pipe.PIPE_READMODE_BYTE | win32pipe.PIPE_WAIT,
             1,            # max instances
-            PIPE_BUFFER,  # out buffer
-            PIPE_BUFFER,  # in buffer
-            0,            # default timeout
-            sa,           # default security
+            PIPE_BUFFER,
+            PIPE_BUFFER,
+            0,
+            None,         # non-inheritable (parent keeps this end)
+        )
+
+        # Open the client end of the pipe with an inheritable handle for the child
+        self._child_handle = win32file.CreateFile(
+            pipe_name,
+            win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+            0,
+            sa,           # inheritable
+            win32file.OPEN_EXISTING,
+            0,
+            None,
+        )
+
+        # Convert the inheritable Win32 handle to a CRT fd number.
+        # os.O_RDWR | os.O_BINARY matches what Node expects on the fd.
+        self._child_fd = msvcrt.open_osfhandle(
+            self._child_handle.handle,
+            os.O_RDWR | os.O_BINARY,
         )
 
         env = os.environ.copy()
-        # On Windows, NODE_CHANNEL_FD holds the pipe *name*, not a numeric fd
-        env["NODE_CHANNEL_FD"] = self._pipe_name
+        env["NODE_CHANNEL_FD"] = str(self._child_fd)
         env["NODE_CHANNEL_SERIALIZATION_MODE"] = "json"
 
         self._proc = subprocess.Popen(
@@ -65,10 +91,14 @@ class NodeIPCProcess:
             stdout=sys.stdout,
             stderr=sys.stderr,
             env=env,
+            close_fds=False,   # allow fd inheritance on Windows
         )
 
-        # Block until Node connects to the pipe
-        win32pipe.ConnectNamedPipe(self._pipe_handle, None)
+        # Parent no longer needs the child-side fd — close it here so that
+        # Node's disconnect detection (EOF/broken-pipe) works correctly.
+        os.close(self._child_fd)
+        self._child_fd = None
+        self._child_handle = None  # handle is now owned by the CRT fd (closed above)
 
         self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
         self._reader_thread.start()
@@ -112,8 +142,7 @@ class NodeIPCProcess:
                 try:
                     _, data = win32file.ReadFile(self._pipe_handle, PIPE_BUFFER)
                 except pywintypes.error as e:
-                    # ERROR_BROKEN_PIPE (109) — Node disconnected cleanly
-                    if e.winerror == 109:
+                    if e.winerror == 109:   # ERROR_BROKEN_PIPE — Node exited cleanly
                         break
                     raise
 
