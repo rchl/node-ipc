@@ -122,8 +122,10 @@ class NodeIPCProcess:
     # ------------------------------------------------------------------
 
     def send(self, message: dict):
-        """Send a JSON message to the Node child (process.on('message', …))."""
-        payload = (json.dumps(message) + "\n").encode()
+        """Send a length-prefixed JSON frame to the Node child."""
+        body = json.dumps(message).encode()
+        # 4-byte little-endian length header + JSON body (no newline)
+        payload = len(body).to_bytes(4, "little") + body
         overlapped = pywintypes.OVERLAPPED()
         overlapped.hEvent = win32event.CreateEvent(None, True, False, None)
         with self._lock:
@@ -145,44 +147,55 @@ class NodeIPCProcess:
     # Internal
     # ------------------------------------------------------------------
 
-    def _read_loop(self):
+    def _overlapped_read(self, nbytes: int) -> bytes | None:
+        """Blocking overlapped read of exactly nbytes. Returns None on pipe close."""
         buf = b""
+        while len(buf) < nbytes:
+            overlapped = pywintypes.OVERLAPPED()
+            overlapped.hEvent = win32event.CreateEvent(None, True, False, None)
+            try:
+                _, chunk = win32file.ReadFile(
+                    self._server_handle, nbytes - len(buf), overlapped
+                )
+            except pywintypes.error as e:
+                if e.winerror != 997:
+                    if e.winerror in (109, 232):
+                        return None
+                    raise
+                chunk = b""
+            if not chunk:
+                win32event.WaitForSingleObject(overlapped.hEvent, win32event.INFINITE)
+                try:
+                    n = win32file.GetOverlappedResult(self._server_handle, overlapped, False)
+                    _, chunk = win32file.ReadFile(self._server_handle, n)
+                except pywintypes.error as e:
+                    if e.winerror in (109, 232):
+                        return None
+                    raise
+            buf += chunk
+        return buf
+
+    def _read_loop(self):
         try:
             while True:
-                overlapped = pywintypes.OVERLAPPED()
-                overlapped.hEvent = win32event.CreateEvent(None, True, False, None)
-                try:
-                    _, data = win32file.ReadFile(self._server_handle, PIPE_BUFFER, overlapped)
-                except pywintypes.error as e:
-                    if e.winerror == 997:   # ERROR_IO_PENDING
-                        win32event.WaitForSingleObject(overlapped.hEvent, win32event.INFINITE)
-                        try:
-                            nbytes = win32file.GetOverlappedResult(
-                                self._server_handle, overlapped, False
-                            )
-                            data = win32file.ReadFile(self._server_handle, nbytes)[1]
-                        except pywintypes.error as e2:
-                            if e2.winerror in (109, 232):   # broken pipe / pipe closing
-                                break
-                            raise
-                    elif e.winerror in (109, 232):
-                        break
-                    else:
-                        raise
+                # Read 4-byte little-endian length header
+                header = self._overlapped_read(4)
+                if header is None:
+                    break
+                msg_len = int.from_bytes(header, "little")
 
-                buf += data
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        msg = json.loads(line)
-                    except json.JSONDecodeError:
-                        print(f"[IPC] bad JSON from Node: {line!r}", file=sys.stderr)
-                        continue
-                    for handler in self._message_handlers:
-                        handler(msg)
+                # Read exactly msg_len bytes of JSON body
+                body = self._overlapped_read(msg_len)
+                if body is None:
+                    break
+
+                try:
+                    msg = json.loads(body.decode())
+                except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                    print(f"[IPC] bad frame from Node: {e}", file=sys.stderr)
+                    continue
+                for handler in self._message_handlers:
+                    handler(msg)
         except Exception as e:
             print(f"[IPC] reader error: {e}", file=sys.stderr)
 
