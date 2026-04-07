@@ -158,19 +158,19 @@ class NodeIPCProcess:
                     self._server_handle, nbytes - len(buf), overlapped
                 )
             except pywintypes.error as e:
-                if e.winerror != 997:
-                    if e.winerror in (109, 232):
-                        return None
-                    raise
-                chunk = b""
-            if not chunk:
-                win32event.WaitForSingleObject(overlapped.hEvent, win32event.INFINITE)
-                try:
-                    n = win32file.GetOverlappedResult(self._server_handle, overlapped, False)
-                    _, chunk = win32file.ReadFile(self._server_handle, n)
-                except pywintypes.error as e:
-                    if e.winerror in (109, 232):
-                        return None
+                if e.winerror == 997:   # ERROR_IO_PENDING — wait then retry
+                    win32event.WaitForSingleObject(overlapped.hEvent, win32event.INFINITE)
+                    try:
+                        _, chunk = win32file.ReadFile(
+                            self._server_handle, nbytes - len(buf), overlapped
+                        )
+                    except pywintypes.error as e2:
+                        if e2.winerror in (109, 232):
+                            return None
+                        raise
+                elif e.winerror in (109, 232):
+                    return None
+                else:
                     raise
             buf += chunk
         return buf
