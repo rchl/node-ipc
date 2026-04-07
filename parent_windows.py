@@ -192,7 +192,7 @@ if __name__ == "__main__":
         print(f"[Python] ← Node: {msg}")
         received.append(msg)
 
-    proc = NodeIPCProcess("child.js").on_message(on_msg).start()
+    proc = NodeIPCProcess("debug.js").on_message(on_msg).start()
 
     time.sleep(0.3)
 
