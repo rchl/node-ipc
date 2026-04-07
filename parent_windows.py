@@ -151,28 +151,25 @@ class NodeIPCProcess:
         """Blocking overlapped read of exactly nbytes. Returns None on pipe close."""
         buf = b""
         while len(buf) < nbytes:
+            chunk_size = nbytes - len(buf)
+            read_buf = bytearray(chunk_size)   # pywin32 requires a writable buffer with overlapped I/O
             overlapped = pywintypes.OVERLAPPED()
             overlapped.hEvent = win32event.CreateEvent(None, True, False, None)
             try:
-                _, chunk = win32file.ReadFile(
-                    self._server_handle, nbytes - len(buf), overlapped
-                )
+                win32file.ReadFile(self._server_handle, read_buf, overlapped)
             except pywintypes.error as e:
-                if e.winerror == 997:   # ERROR_IO_PENDING — wait then retry
-                    win32event.WaitForSingleObject(overlapped.hEvent, win32event.INFINITE)
-                    try:
-                        _, chunk = win32file.ReadFile(
-                            self._server_handle, nbytes - len(buf), overlapped
-                        )
-                    except pywintypes.error as e2:
-                        if e2.winerror in (109, 232):
-                            return None
-                        raise
-                elif e.winerror in (109, 232):
-                    return None
-                else:
+                if e.winerror != 997:   # anything other than ERROR_IO_PENDING is a real error
+                    if e.winerror in (109, 232):
+                        return None
                     raise
-            buf += chunk
+            win32event.WaitForSingleObject(overlapped.hEvent, win32event.INFINITE)
+            try:
+                n = win32file.GetOverlappedResult(self._server_handle, overlapped, False)
+            except pywintypes.error as e:
+                if e.winerror in (109, 232):
+                    return None
+                raise
+            buf += bytes(read_buf[:n])
         return buf
 
     def _read_loop(self):
