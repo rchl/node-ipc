@@ -4,6 +4,7 @@ using Node's native IPC channel on Windows (named pipe + newline-delimited JSON)
 """
 
 import json
+import time
 import os
 import subprocess
 import sys
@@ -40,6 +41,7 @@ class NodeIPCProcess:
         # Unique named pipe — Node expects \\.\pipe\<name>
         self._pipe_name = f"\\\\.\\pipe\\node-ipc-{uuid.uuid4().hex}"
 
+        sa = pywintypes.SECURITY_ATTRIBUTES()
         # Create the named pipe (server side, Python is the server)
         self._pipe_handle = win32pipe.CreateNamedPipe(
             self._pipe_name,
@@ -49,7 +51,7 @@ class NodeIPCProcess:
             PIPE_BUFFER,  # out buffer
             PIPE_BUFFER,  # in buffer
             0,            # default timeout
-            None,         # default security
+            sa,           # default security
         )
 
         env = os.environ.copy()
@@ -137,8 +139,6 @@ class NodeIPCProcess:
 # ======================================================================
 
 if __name__ == "__main__":
-    import time
-
     received: list[dict[str, object]] = []
 
     def on_msg(msg: dict[str, object]):
