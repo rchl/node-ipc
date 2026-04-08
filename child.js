@@ -11,7 +11,7 @@ function main() {
         process.exit(0)
     })
 
-    process.send({ type: 'hello', text: 'message from child' })
+    setTimeout(() => process.send({ type: 'hello', text: 'message from child' }), 2000)
 }
 
 main()

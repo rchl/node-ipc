@@ -430,7 +430,7 @@ if __name__ == "__main__":
         payload: dict[str, object] = {"type": "ping", "seq": i, "text": f"Hello from Python #{i}"}
         print(f"[Python] → Node: {payload}")
         proc.send(payload)
-        time.sleep(0.4)
+        time.sleep(1.0)
 
     proc.send({"type": "exit"})
     proc.wait()
