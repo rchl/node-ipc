@@ -352,30 +352,31 @@ class NodeIPCProcess:
                 read_buf = win32file.AllocateReadBuffer(PIPE_BUFFER)
                 ov = pywintypes.OVERLAPPED()
                 ov.hEvent = win32event.CreateEvent(None, True, False, None)
-                n = None
+
                 try:
-                    rc, data = win32file.ReadFile(self._server_handle, read_buf, ov)
-                    # rc == 0 → synchronous completion; data contains bytes read
-                    if rc == 0:
-                        buf += bytes(data) if data else b""
-                        n = 0   # already appended
+                    win32file.ReadFile(self._server_handle, read_buf, ov)
+                    # Synchronous completion — event is signaled, fall through to wait
                 except pywintypes.error as e:
-                    if e.winerror == 997:   # ERROR_IO_PENDING
-                        win32event.WaitForSingleObject(ov.hEvent, win32event.INFINITE)
-                        try:
-                            n = win32file.GetOverlappedResult(self._server_handle, ov, False)
-                        except pywintypes.error as e2:
-                            if e2.winerror in (109, 232):   # pipe broken / closing
-                                break
-                            raise
-                    elif e.winerror in (109, 232):
+                    if e.winerror == 997:   # ERROR_IO_PENDING — normal for overlapped
+                        pass
+                    elif e.winerror in (109, 232):   # pipe broken / closing
                         break
                     else:
                         raise
-                if n is None:
+
+                # Always wait: handles both the sync-but-still-signaled and async cases
+                win32event.WaitForSingleObject(ov.hEvent, win32event.INFINITE)
+
+                try:
+                    n = win32file.GetOverlappedResult(self._server_handle, ov, False)
+                except pywintypes.error as e:
+                    if e.winerror in (109, 232):
+                        break
+                    raise
+
+                if n == 0:
                     continue
-                if n > 0:
-                    buf += bytes(read_buf[:n])
+                buf += bytes(read_buf[:n])
 
                 # Parse complete IPC frames out of the buffer
                 while len(buf) >= IPC_HEADER_SIZE:
