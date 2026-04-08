@@ -94,6 +94,10 @@ class PROCESS_INFORMATION(ctypes.Structure):
     ]
 
 
+class ServerStoppedError(Exception):
+    pass
+
+
 # -----------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------
@@ -220,6 +224,7 @@ class NodeIPCProcess:
         pipe_name = f"\\\\.\\pipe\\node-ipc-{uuid.uuid4().hex}"
         cur_proc  = win32api.GetCurrentProcess()
 
+        sa = pywintypes.SECURITY_ATTRIBUTES()
         # Server end — FILE_FLAG_OVERLAPPED required to match libuv's async I/O
         self._server_handle = win32pipe.CreateNamedPipe(
             pipe_name,
@@ -229,7 +234,7 @@ class NodeIPCProcess:
             PIPE_BUFFER,
             PIPE_BUFFER,
             0,
-            None,       # non-inheritable
+            sa,       # non-inheritable
         )
 
         # Put server into listening state (overlapped → doesn't block)
@@ -251,13 +256,13 @@ class NodeIPCProcess:
             win32file.FILE_FLAG_OVERLAPPED,
             None,
         )
-        inheritable_client = win32api.DuplicateHandle(
-            cur_proc, client_handle, cur_proc,
+        inheritable_client_ipc_handle = win32api.DuplicateHandle(
+            cur_proc, client_handle.handle, cur_proc,
             0,
             True,   # bInheritHandle
             2,      # DUPLICATE_SAME_ACCESS
         )
-        win32file.CloseHandle(client_handle)
+        win32file.CloseHandle(client_handle.handle)
 
         # Wait for ConnectNamedPipe to complete (client CreateFile already triggered it)
         win32event.WaitForSingleObject(connect_ov.hEvent, win32event.INFINITE)
@@ -270,11 +275,10 @@ class NodeIPCProcess:
         parts = ["node", self.script_path] + self.args
         cmd   = " ".join(f'"{p}"' if (" " in p or not p) else p for p in parts)
 
-        ipc_handle_int = int(inheritable_client.handle)
-        hProcess, _pid = _spawn_node(cmd, env, ipc_handle_int)
+        hProcess, _pid = _spawn_node(cmd, env, int(inheritable_client_ipc_handle))  # ipc_handle is technically a PyHANDLE
 
         # Child has inherited its copy of the handle — close the parent's copy
-        win32file.CloseHandle(inheritable_client)
+        win32file.CloseHandle(inheritable_client_ipc_handle)
 
         self._proc = _ProcHandle(hProcess, _pid)
 
@@ -311,6 +315,8 @@ class NodeIPCProcess:
         ov = pywintypes.OVERLAPPED()
         ov.hEvent = win32event.CreateEvent(None, True, False, None)
         with self._lock:
+            if not self._server_handle:
+                raise ServerStoppedError
             try:
                 rc, _ = win32file.WriteFile(self._server_handle, payload, ov)
                 if rc != 0:
@@ -354,6 +360,8 @@ class NodeIPCProcess:
                 ov.hEvent = win32event.CreateEvent(None, True, False, None)
 
                 try:
+                    if not self._server_handle:
+                        raise ServerStoppedError
                     win32file.ReadFile(self._server_handle, read_buf, ov)
                     # Synchronous completion — event is signaled, fall through to wait
                 except pywintypes.error as e:
@@ -368,6 +376,8 @@ class NodeIPCProcess:
                 win32event.WaitForSingleObject(ov.hEvent, win32event.INFINITE)
 
                 try:
+                    if not self._server_handle:
+                        raise ServerStoppedError
                     n = win32file.GetOverlappedResult(self._server_handle, ov, False)
                 except pywintypes.error as e:
                     if e.winerror in (109, 232):
