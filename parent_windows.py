@@ -296,8 +296,18 @@ class NodeIPCProcess:
     # ------------------------------------------------------------------
 
     def send(self, message: dict) -> None:
-        """Send a newline-delimited JSON message to the Node child."""
-        payload = (json.dumps(message) + "\n").encode()
+        """Send a message to the Node child wrapped in a libuv IPC frame.
+
+        libuv IPC frame layout (uv__ipc_frame_header_t, 16 bytes):
+            uint32_t flags        – UV__IPC_FRAME_HAS_DATA = 0x01
+            uint32_t reserved1    – 0
+            uint32_t data_length  – byte length of the payload
+            uint32_t reserved2    – 0
+        Immediately followed by data_length bytes of payload.
+        """
+        data    = (json.dumps(message) + "\n").encode()
+        header  = struct.pack("<IIII", 0x01, 0, len(data), 0)
+        payload = header + data
         ov = pywintypes.OVERLAPPED()
         ov.hEvent = win32event.CreateEvent(None, True, False, None)
         with self._lock:
@@ -324,6 +334,18 @@ class NodeIPCProcess:
     # ------------------------------------------------------------------
 
     def _read_loop(self) -> None:
+        """Read libuv IPC frames from the server handle and dispatch messages.
+
+        Frame layout (matches uv__ipc_frame_header_t + optional socket xfer + data):
+            [16-byte header: flags u32, reserved u32, data_length u32, reserved u32]
+            [632-byte socket-xfer block]  ← only if flags & 0x02
+            [data_length bytes payload]   ← only if flags & 0x01
+        """
+        IPC_HEADER_SIZE     = 16
+        IPC_SOCKET_XFER_SIZE = 632
+        IPC_HAS_DATA        = 0x01
+        IPC_HAS_SOCKET_XFER = 0x02
+
         buf = b""
         try:
             while True:
@@ -350,19 +372,38 @@ class NodeIPCProcess:
                         raise
                 if n is None or n == 0:
                     continue
+
                 buf += bytes(read_buf[:n])
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        msg = json.loads(line)
-                    except json.JSONDecodeError:
-                        print(f"[IPC] bad JSON from Node: {line!r}", file=sys.stderr)
-                        continue
-                    for handler in self._message_handlers:
-                        handler(msg)
+
+                # Parse complete IPC frames out of the buffer
+                while len(buf) >= IPC_HEADER_SIZE:
+                    flags, _r1, data_length, _r2 = struct.unpack_from("<IIII", buf)
+
+                    # Compute total frame size so we know when we have enough bytes
+                    frame_size = IPC_HEADER_SIZE
+                    if flags & IPC_HAS_SOCKET_XFER:
+                        frame_size += IPC_SOCKET_XFER_SIZE
+                    if flags & IPC_HAS_DATA:
+                        frame_size += data_length
+
+                    if len(buf) < frame_size:
+                        break   # wait for more bytes
+
+                    # Extract payload (skip socket-xfer block if present)
+                    if flags & IPC_HAS_DATA:
+                        data_start = IPC_HEADER_SIZE + (IPC_SOCKET_XFER_SIZE if flags & IPC_HAS_SOCKET_XFER else 0)
+                        data = buf[data_start : data_start + data_length]
+                        line = data.strip()
+                        if line:
+                            try:
+                                msg = json.loads(line)
+                            except json.JSONDecodeError:
+                                print(f"[IPC] bad JSON from Node: {line!r}", file=sys.stderr)
+                            else:
+                                for handler in self._message_handlers:
+                                    handler(msg)
+
+                    buf = buf[frame_size:]
         except Exception as exc:
             print(f"[IPC] reader error: {exc}", file=sys.stderr)
 
