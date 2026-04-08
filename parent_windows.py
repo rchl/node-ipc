@@ -349,14 +349,16 @@ class NodeIPCProcess:
         buf = b""
         try:
             while True:
-                read_buf = bytearray(PIPE_BUFFER)
+                read_buf = win32file.AllocateReadBuffer(PIPE_BUFFER)
                 ov = pywintypes.OVERLAPPED()
                 ov.hEvent = win32event.CreateEvent(None, True, False, None)
                 n = None
                 try:
-                    rc, _ = win32file.ReadFile(self._server_handle, read_buf, ov)
+                    rc, data = win32file.ReadFile(self._server_handle, read_buf, ov)
+                    # rc == 0 → synchronous completion; data contains bytes read
                     if rc == 0:
-                        n = win32file.GetOverlappedResult(self._server_handle, ov, False)
+                        buf += bytes(data) if data else b""
+                        n = 0   # already appended
                 except pywintypes.error as e:
                     if e.winerror == 997:   # ERROR_IO_PENDING
                         win32event.WaitForSingleObject(ov.hEvent, win32event.INFINITE)
@@ -370,10 +372,10 @@ class NodeIPCProcess:
                         break
                     else:
                         raise
-                if n is None or n == 0:
+                if n is None:
                     continue
-
-                buf += bytes(read_buf[:n])
+                if n > 0:
+                    buf += bytes(read_buf[:n])
 
                 # Parse complete IPC frames out of the buffer
                 while len(buf) >= IPC_HEADER_SIZE:
