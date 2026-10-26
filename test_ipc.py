@@ -1,18 +1,12 @@
 """
 End-to-end test of the Python <-> Node IPC bridge.
-
-Uses parent_windows.py on Windows and parent.py elsewhere.
 """
 
 import asyncio
 import os
-import sys
 import unittest
 
-if sys.platform == "win32":
-    from parent_windows import NodeIPCProcess
-else:
-    from parent import NodeIPCProcess
+from node_ipc import NodeIPCProcess
 
 CHILD_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "child.js")
 TIMEOUT = 15

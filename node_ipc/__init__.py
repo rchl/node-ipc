@@ -1,20 +1,27 @@
 """
-Python parent process that communicates with a Node.js child process
-using Node's native IPC channel protocol (newline-delimited JSON over a
-Unix socket whose fd number is passed in NODE_CHANNEL_FD).
+Spawn a Node.js script from Python and talk to it over Node's native IPC
+channel, the one child_process.fork() sets up.
+
+Messages are newline-delimited JSON. How the channel is created and how
+bytes travel over it differs per platform, so that part lives in a
+backend module: _posix on Linux and macOS, _windows on Windows. Each
+backend provides spawn(), encode() and read_chunk().
 """
 
 import asyncio
 import contextlib
 import json
-import os
-import socket
 import sys
 from collections.abc import AsyncIterator
 from types import TracebackType
 from typing import Self, final
 
-READ_CHUNK_SIZE = 65536
+if sys.platform == "win32":
+    from . import _windows as _backend
+else:
+    from . import _posix as _backend
+
+__all__ = ["NodeIPCProcess"]
 
 
 @final
@@ -29,7 +36,7 @@ class NodeIPCProcess:
                 ...
     """
 
-    _proc: asyncio.subprocess.Process | None = None
+    _proc: _backend.Process | None = None
     _reader: asyncio.StreamReader
     _writer: asyncio.StreamWriter
 
@@ -44,33 +51,8 @@ class NodeIPCProcess:
     # ------------------------------------------------------------------
 
     async def start(self) -> Self:
-        """Spawn the Node child with one end of a socket pair as its IPC channel."""
-
-        # Node needs a single fd that is both readable and writable,
-        # so give it one end of a Unix socket pair and keep the other.
-        parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
-
-        with child_sock:
-            child_fd = child_sock.fileno()
-
-            # NODE_CHANNEL_FD can be any fd number; pass_fds keeps the number
-            # unchanged in the child, so no dup2 onto a fixed fd is needed.
-            env = os.environ.copy()
-            env["NODE_CHANNEL_FD"] = str(child_fd)
-            env["NODE_CHANNEL_SERIALIZATION_MODE"] = "json"
-
-            try:
-                self._proc = await asyncio.create_subprocess_exec(
-                    "node", self.script_path, *self.args,
-                    pass_fds=(child_fd,),
-                    stdin=asyncio.subprocess.DEVNULL,
-                    env=env,
-                )
-            except BaseException:
-                parent_sock.close()
-                raise
-
-        self._reader, self._writer = await asyncio.open_unix_connection(sock=parent_sock)
+        """Spawn the Node child with its IPC channel connected to us."""
+        self._proc, self._reader, self._writer = await _backend.spawn(self.script_path, self.args)
         return self
 
     async def close(self) -> None:
@@ -107,7 +89,7 @@ class NodeIPCProcess:
 
     async def send(self, message: dict[str, object]) -> None:
         """Send a JSON message to the Node child (process.on('message', …))."""
-        self._writer.write((json.dumps(message) + "\n").encode())
+        self._writer.write(_backend.encode((json.dumps(message) + "\n").encode()))
         await self._writer.drain()
 
     async def receive(self) -> dict[str, object]:
@@ -136,15 +118,13 @@ class NodeIPCProcess:
     async def _read_line(self) -> bytes:
         """Return the next line from Node without its newline.
 
-        Unlike StreamReader.readline() this has no length limit, as Node
-        puts no limit on message size.
+        A line may span several reads, so data is buffered until a newline
+        arrives, with no length limit (Node puts none on message size).
+        Only newly read bytes are searched each time.
         """
         while (end := self._buffer.find(b"\n", self._scanned)) < 0:
             self._scanned = len(self._buffer)
-            chunk = await self._reader.read(READ_CHUNK_SIZE)
-            if not chunk:
-                raise EOFError("IPC channel closed")
-            self._buffer += chunk
+            self._buffer += await _backend.read_chunk(self._reader)
         line = bytes(self._buffer[:end])
         del self._buffer[: end + 1]
         self._scanned = 0
