@@ -100,7 +100,7 @@ The tests run against `child.js`:
 
 Each test, including cleanup, has a 15-second timeout.
 
-CI (`.github/workflows/test.yml`) runs the tests on Linux, macOS and Windows with Node 20, 22 and 24. A final `test-result` job passes only if every run passed, and merging into `main` requires that check.
+CI (`.github/workflows/test.yml`) runs the tests on Linux, macOS and Windows with Node 20, 22 and 24. A `lint and typecheck` job runs ruff, and basedpyright for both Linux and Windows. A final `test-result` job passes only if all of these passed, and merging into `main` requires that check.
 
 ## Linting and type checking
 

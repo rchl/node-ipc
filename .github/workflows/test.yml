@@ -33,14 +33,38 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: "1"
 
-  # Single check to require in branch rules, so the matrix can change freely.
+  lint:
+    name: lint and typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v10.3.2
+
+      - name: Install Python dependencies
+        run: uv sync --locked
+
+      - name: Ruff
+        run: uv run ruff check --output-format=github .
+
+      # Each backend is only type-checked for its own platform, so check both.
+      # basedpyright bundles pywin32's stubs, so this runs on Linux.
+      - name: basedpyright (Linux)
+        run: uv run basedpyright --pythonplatform Linux
+
+      - name: basedpyright (Windows)
+        run: uv run basedpyright --pythonplatform Windows
+
+  # Single check to require in branch rules, so the jobs above can change freely.
   test-result:
     name: test-result
-    needs: test
+    needs: [test, lint]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Check test results
+      - name: Check results
         run: |
-          echo "test jobs: ${{ needs.test.result }}"
+          echo "test jobs: ${{ needs.test.result }}, lint: ${{ needs.lint.result }}"
           test "${{ needs.test.result }}" = success
+          test "${{ needs.lint.result }}" = success
