@@ -6,7 +6,7 @@ The child is a plain Node script: it uses `process.send()` and `process.on('mess
 
 ```python
 import asyncio
-from parent import NodeIPCProcess  # parent_windows on Windows
+from node_ipc import NodeIPCProcess
 
 async def main():
     async with NodeIPCProcess("child.js") as proc:
@@ -29,15 +29,10 @@ uv sync
 
 ## API
 
-`parent.py` (Linux and macOS) and `parent_windows.py` (Windows) each export a `NodeIPCProcess` class with the same API. Pick one based on the platform:
+The `node_ipc` package exports one class, `NodeIPCProcess`, which works the same on every platform:
 
 ```python
-import sys
-
-if sys.platform == "win32":
-    from parent_windows import NodeIPCProcess
-else:
-    from parent import NodeIPCProcess
+from node_ipc import NodeIPCProcess
 ```
 
 | Member | Description |
@@ -54,15 +49,16 @@ The child's stdout and stderr are inherited from the Python process.
 
 ## How it works
 
-Node activates the IPC channel when it starts with `NODE_CHANNEL_FD` set to a file descriptor. Messages then go over that descriptor. Both parents also set `NODE_CHANNEL_SERIALIZATION_MODE=json`.
+Node activates the IPC channel when it starts with `NODE_CHANNEL_FD` set to a file descriptor. Messages then go over that descriptor, and `NODE_CHANNEL_SERIALIZATION_MODE=json` makes each message one line of JSON, ending in a newline.
 
-### Linux and macOS (`parent.py`)
+`NodeIPCProcess` handles the JSON lines on every platform. A backend creates the channel and moves bytes over it, and the package picks the backend for the current platform when it's imported.
+
+### Linux and macOS (`node_ipc/_posix.py`)
 
 - The parent creates a Unix socket pair and passes one end to the child with `pass_fds`. `NODE_CHANNEL_FD` is set to that end's fd number.
-- Each message is one line of JSON, ending in a newline.
 - The child is started with `asyncio.create_subprocess_exec`, and the parent's end of the socket is used as an asyncio stream.
 
-### Windows (`parent_windows.py`)
+### Windows (`node_ipc/_windows.py`)
 
 Windows needs more work, because Node expects the channel at C runtime file descriptor 3, and `subprocess` has no way to set that up.
 
@@ -82,8 +78,9 @@ This needs the `ProactorEventLoop`, which is asyncio's default on Windows. `star
 
 | File | Purpose |
 |---|---|
-| `parent.py` | Python parent for Linux and macOS |
-| `parent_windows.py` | Python parent for Windows |
+| `node_ipc/__init__.py` | `NodeIPCProcess`: the shared API, message framing as JSON lines, and choosing the platform backend |
+| `node_ipc/_posix.py` | Linux and macOS backend: spawning with a socket pair, raw bytes |
+| `node_ipc/_windows.py` | Windows backend: named pipe, `CreateProcessW` with fd 3, libuv frames |
 | `child.js` | Example child. It sends a `hello` message after 2 seconds, logs what it receives, sends back any `{"type": "echo"}` message, and exits on `{"type": "exit"}` or when the channel closes. |
 | `debug.js` | Diagnostic child. It prints the IPC environment it sees, then sends one test message, retrying if the send fails. Use it in place of `child.js` when the channel doesn't come up. |
 | `parent.ts` | Node-to-Node reference that forks `child.js` with `child_process.fork()`. Run it with `npm install` then `npm run run`. It doesn't exit on its own, so stop it with Ctrl+C. |
@@ -113,4 +110,4 @@ uv run ruff check .
 uv run basedpyright
 ```
 
-Each parent module only type-checks on its own platform. To check the Windows module from Linux or macOS, run `uv run basedpyright --pythonplatform Windows parent_windows.py`.
+To type-check the Windows backend from Linux or macOS, run `uv run basedpyright --pythonplatform Windows`. Each backend starts with a `sys.platform` assertion, so code for the other platform is skipped instead of reported as errors.
