@@ -4,6 +4,7 @@ pair, whose fd number is passed in NODE_CHANNEL_FD. Bytes are sent as-is.
 """
 
 import asyncio
+import contextlib
 import os
 import socket
 import sys
@@ -42,7 +43,16 @@ async def spawn(script_path: str, args: list[str]) -> tuple[Process, asyncio.Str
             parent_sock.close()
             raise
 
-    reader, writer = await asyncio.open_unix_connection(sock=parent_sock)
+    try:
+        reader, writer = await asyncio.open_unix_connection(sock=parent_sock)
+    except BaseException:
+        # Don't leave the child running if connecting fails or is cancelled;
+        # the caller never gets the process, so nothing else can stop it.
+        parent_sock.close()
+        with contextlib.suppress(ProcessLookupError):
+            proc.terminate()
+        await proc.wait()
+        raise
     return proc, reader, writer
 
 
