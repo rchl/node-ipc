@@ -25,6 +25,7 @@ import ctypes
 import ctypes.wintypes as wintypes
 import os
 import struct
+import subprocess
 import sys
 import uuid
 
@@ -259,9 +260,8 @@ async def spawn(script_path: str, args: list[str]) -> tuple[Process, asyncio.Str
         env["NODE_CHANNEL_FD"] = "3"        # CRT fd 3 — set via lpReserved2
         env["NODE_CHANNEL_SERIALIZATION_MODE"] = "json"
 
-        # Build command line (quote tokens that contain spaces)
-        parts = ["node", script_path, *args]
-        cmd   = " ".join(f'"{p}"' if (" " in p or not p) else p for p in parts)
+        # Quote and escape per the MSVC C runtime rules that Node parses argv with
+        cmd = subprocess.list2cmdline(["node", script_path, *args])
 
         try:
             hProcess, pid = _spawn_node(cmd, env, int(server_handle))
