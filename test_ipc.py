@@ -4,7 +4,10 @@ End-to-end test of the Python <-> Node IPC bridge.
 
 import asyncio
 import os
+import sys
 import unittest
+from typing import Any
+from unittest import mock
 
 from node_ipc import NodeIPCProcess
 
@@ -54,6 +57,27 @@ class NodeIPCTest(unittest.IsolatedAsyncioTestCase):
             else:
                 self.fail("no argv from child")
             self.assertEqual(msg["argv"], args)
+
+    @unittest.skipIf(sys.platform == "win32", "the POSIX backend connects after spawning")
+    async def test_failed_start_stops_child(self) -> None:
+        spawned: list[asyncio.subprocess.Process] = []
+        create_subprocess_exec = asyncio.create_subprocess_exec
+
+        async def record_spawn(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+            proc = await create_subprocess_exec(*args, **kwargs)
+            spawned.append(proc)
+            return proc
+
+        with (
+            mock.patch("asyncio.create_subprocess_exec", record_spawn),
+            mock.patch("asyncio.open_unix_connection", side_effect=OSError("connect failed")),
+        ):
+            async with asyncio.timeout(TIMEOUT):
+                with self.assertRaises(OSError):
+                    await NodeIPCProcess(CHILD_SCRIPT).start()
+
+        self.assertEqual(len(spawned), 1)
+        self.assertIsNotNone(spawned[0].returncode, "child is still running")
 
 
 if __name__ == "__main__":
