@@ -32,3 +32,15 @@ jobs:
         run: uv run python -B test_ipc.py -v
         env:
           PYTHONDONTWRITEBYTECODE: "1"
+
+  # Single check to require in branch rules, so the matrix can change freely.
+  test-result:
+    name: test-result
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check test results
+        run: |
+          echo "test jobs: ${{ needs.test.result }}"
+          test "${{ needs.test.result }}" = success
