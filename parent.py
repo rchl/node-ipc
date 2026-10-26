@@ -73,7 +73,7 @@ class NodeIPCProcess:
         self._proc = subprocess.Popen(
             ["node", self.script_path] + self.args,
             pass_fds=(child_fd,),   # fd 3 is now explicitly passed through
-            stdin=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
             stdout=sys.stdout,
             stderr=sys.stderr,
             env=env,
@@ -97,6 +97,15 @@ class NodeIPCProcess:
         if self._proc:
             self._proc.terminate()
             self._proc.wait()
+            # Shut down first so the reader thread sees EOF before we close
+            try:
+                self._ipc_sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            if self._reader_thread:
+                self._reader_thread.join(timeout=1)
+            self._ipc_file.close()
+            self._ipc_sock.close()
 
     # ------------------------------------------------------------------
     # Messaging
@@ -136,32 +145,3 @@ class NodeIPCProcess:
                     handler(msg)
         except Exception as e:
             print(f"[IPC] reader error: {e}", file=sys.stderr)
-
-
-# ======================================================================
-# Demo — run this file directly to test the bridge
-# ======================================================================
-
-if __name__ == "__main__":
-    import time
-
-    received: list[dict[str, object]] = []
-
-    def on_msg(msg: dict[str, object]) -> None:
-        print(f"[Python] ← Node: {msg}")
-        received.append(msg)
-
-    proc = NodeIPCProcess("child.js").on_message(on_msg).start()
-
-    # Give Node a moment to initialise
-    time.sleep(0.3)
-
-    for i in range(3):
-        payload: dict[str, object] = {"type": "ping", "seq": i, "text": f"Hello from Python #{i}"}
-        print(f"[Python] → Node: {payload}")
-        proc.send(payload)
-        time.sleep(0.4)
-
-    proc.send({"type": "exit"})
-    proc.wait()
-    print(f"\n[Python] done. Received {len(received)} messages from Node.")
