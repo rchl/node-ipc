@@ -5,7 +5,8 @@ channel, the one child_process.fork() sets up.
 Messages are newline-delimited JSON. How the channel is created and how
 bytes travel over it differs per platform, so that part lives in a
 backend module: _posix on Linux and macOS, _windows on Windows. Each
-backend provides spawn(), encode() and read_chunk().
+backend provides spawn(), encode() and read_chunk(), as described by the
+Backend protocol in _types.
 """
 
 import asyncio
@@ -16,10 +17,15 @@ from collections.abc import AsyncIterator
 from types import TracebackType
 from typing import Self, final
 
+from ._types import Backend, Process
+
 if sys.platform == "win32":
-    from . import _windows as _backend
+    from . import _windows as _platform_backend
 else:
-    from . import _posix as _backend
+    from . import _posix as _platform_backend
+
+# Typed as the protocol so the type checker verifies the backend matches it
+_backend: Backend = _platform_backend
 
 __all__ = ["NodeIPCProcess"]
 
@@ -36,7 +42,7 @@ class NodeIPCProcess:
                 ...
     """
 
-    _proc: _backend.Process | None = None
+    _proc: Process | None = None
     _reader: asyncio.StreamReader
     _writer: asyncio.StreamWriter
 

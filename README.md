@@ -79,6 +79,7 @@ This needs the `ProactorEventLoop`, which is asyncio's default on Windows. `star
 | File | Purpose |
 |---|---|
 | `node_ipc/__init__.py` | `NodeIPCProcess`: the shared API, message framing as JSON lines, and choosing the platform backend |
+| `node_ipc/_types.py` | `Backend` and `Process` protocols that both platform backends must match |
 | `node_ipc/_posix.py` | Linux and macOS backend: spawning with a socket pair, raw bytes |
 | `node_ipc/_windows.py` | Windows backend: named pipe, `CreateProcessW` with fd 3, libuv frames |
 | `child.js` | Example child. It sends a `hello` message after 2 seconds, logs what it receives, sends back any `{"type": "echo"}` message, and exits on `{"type": "exit"}` or when the channel closes. |
@@ -110,4 +111,6 @@ uv run ruff check .
 uv run basedpyright
 ```
 
-To type-check the Windows backend from Linux or macOS, run `uv run basedpyright --pythonplatform Windows`. Each backend starts with a `sys.platform` assertion, so code for the other platform is skipped instead of reported as errors.
+To type-check the Windows backend from Linux or macOS, run `uv run basedpyright --pythonplatform Windows`. Each backend asserts its platform right after its imports, so the other platform's backend is skipped instead of reported as errors. Both backends are checked against the `Backend` protocol in `node_ipc/_types.py`, but each only when checking for its own platform, so run both checks after changing a backend.
+
+On Linux and macOS, basedpyright also warns that it can't find the source for `pywintypes`, `win32file` and `win32pipe`. These warnings are expected, because pywin32 is only installed on Windows, and its bundled type stubs are still used.
