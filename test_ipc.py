@@ -58,6 +58,14 @@ class NodeIPCTest(unittest.IsolatedAsyncioTestCase):
                 self.fail("no argv from child")
             self.assertEqual(msg["argv"], args)
 
+    async def test_start_twice(self) -> None:
+        async with asyncio.timeout(TIMEOUT), NodeIPCProcess(CHILD_SCRIPT) as proc:
+            with self.assertRaises(RuntimeError):
+                await proc.start()
+            # The first child is unaffected.
+            await proc.send({"type": "exit"})
+            self.assertEqual(await proc.wait(), 0)
+
     @unittest.skipIf(sys.platform == "win32", "the POSIX backend connects after spawning")
     async def test_failed_start_stops_child(self) -> None:
         spawned: list[asyncio.subprocess.Process] = []
