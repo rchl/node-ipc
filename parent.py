@@ -136,32 +136,3 @@ class NodeIPCProcess:
                     handler(msg)
         except Exception as e:
             print(f"[IPC] reader error: {e}", file=sys.stderr)
-
-
-# ======================================================================
-# Demo — run this file directly to test the bridge
-# ======================================================================
-
-if __name__ == "__main__":
-    import time
-
-    received: list[dict[str, object]] = []
-
-    def on_msg(msg: dict[str, object]) -> None:
-        print(f"[Python] ← Node: {msg}")
-        received.append(msg)
-
-    proc = NodeIPCProcess("child.js").on_message(on_msg).start()
-
-    # Give Node a moment to initialise
-    time.sleep(0.3)
-
-    for i in range(3):
-        payload: dict[str, object] = {"type": "ping", "seq": i, "text": f"Hello from Python #{i}"}
-        print(f"[Python] → Node: {payload}")
-        proc.send(payload)
-        time.sleep(0.4)
-
-    proc.send({"type": "exit"})
-    proc.wait()
-    print(f"\n[Python] done. Received {len(received)} messages from Node.")

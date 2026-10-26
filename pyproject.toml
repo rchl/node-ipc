@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.13"
 dependencies = [
-    "pywin32>=311",
+    "pywin32>=311; sys_platform == 'win32'",
 ]
 
 [tool.pyright]

@@ -22,7 +22,6 @@ import os
 import struct
 import sys
 import threading
-import time
 import uuid
 from collections.abc import Callable
 from typing import final
@@ -419,29 +418,3 @@ class NodeIPCProcess:
                     buf = buf[frame_size:]
         except Exception as exc:
             print(f"[IPC] reader error: {exc}", file=sys.stderr)
-
-
-# ======================================================================
-# Demo
-# ======================================================================
-
-if __name__ == "__main__":
-    received: list[dict[str, object]] = []
-
-    def on_msg(msg: dict[str, object]) -> None:
-        print(f"[Python] ← Node: {msg}")
-        received.append(msg)
-
-    proc = NodeIPCProcess("child.js").on_message(on_msg).start()
-
-    time.sleep(0.3)
-
-    for i in range(3):
-        payload: dict[str, object] = {"type": "ping", "seq": i, "text": f"Hello from Python #{i}"}
-        print(f"[Python] → Node: {payload}")
-        proc.send(payload)
-        time.sleep(1.0)
-
-    proc.send({"type": "exit"})
-    proc.wait()
-    print(f"\n[Python] done. Received {len(received)} messages from Node.")
