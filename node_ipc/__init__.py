@@ -51,7 +51,13 @@ class NodeIPCProcess:
     # ------------------------------------------------------------------
 
     async def start(self) -> Self:
-        """Spawn the Node child with its IPC channel connected to us."""
+        """Spawn the Node child with its IPC channel connected to us.
+
+        Each instance runs one child: starting it again raises RuntimeError,
+        even after close(). A start that failed can be retried.
+        """
+        if self._proc:
+            raise RuntimeError("NodeIPCProcess already started")
         self._proc, self._reader, self._writer = await _backend.spawn(self.script_path, self.args)
         return self
 

@@ -39,7 +39,7 @@ from node_ipc import NodeIPCProcess
 |---|---|
 | `NodeIPCProcess(script_path, args=None)` | Set up a child that runs `node script_path *args`. Nothing is spawned until it is started. |
 | `async with NodeIPCProcess(...) as proc` | Start the child on entry. On exit, terminate it if it is still running and close the channel. |
-| `await proc.start()` / `await proc.close()` | The same steps as `async with`, without the context manager. |
+| `await proc.start()` / `await proc.close()` | The same steps as `async with`, without the context manager. Each instance runs one child, so starting it again raises `RuntimeError`, even after `close()`. |
 | `await proc.send(message)` | Send a JSON-serializable dict. The child receives it in `process.on('message')`. |
 | `await proc.receive()` | Wait for the next message the child sent with `process.send()`. Raises `EOFError` once the channel is closed. |
 | `async for message in proc` | Iterate over incoming messages until the channel closes. |
