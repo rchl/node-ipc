@@ -246,7 +246,8 @@ class NodeIPCProcess:
     def __init__(self, script_path: str, args: list[str] | None = None):
         self.script_path = script_path
         self.args        = args or []
-        self._buffer     = b""
+        self._buffer     = bytearray()
+        self._scanned    = 0  # bytes of _buffer already searched for a newline
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -349,12 +350,7 @@ class NodeIPCProcess:
     async def receive(self) -> dict[str, object]:
         """Wait for the next message from Node. Raises EOFError once the channel closes."""
         while True:
-            line, sep, rest = self._buffer.partition(b"\n")
-            if not sep:
-                self._buffer += await self._read_frame()
-                continue
-            self._buffer = rest
-            line = line.strip()
+            line = (await self._read_line()).strip()
             if not line:
                 continue
             try:
@@ -373,6 +369,20 @@ class NodeIPCProcess:
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    async def _read_line(self) -> bytes:
+        """Return the next line from Node without its newline.
+
+        A line may span several IPC frames, so frames are buffered until a
+        newline arrives. Only newly read bytes are searched each time.
+        """
+        while (end := self._buffer.find(b"\n", self._scanned)) < 0:
+            self._scanned = len(self._buffer)
+            self._buffer += await self._read_frame()
+        line = bytes(self._buffer[:end])
+        del self._buffer[: end + 1]
+        self._scanned = 0
+        return line
 
     async def _read_frame(self) -> bytes:
         """Read one libuv IPC frame and return its payload."""
