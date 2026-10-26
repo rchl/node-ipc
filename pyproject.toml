@@ -7,6 +7,27 @@ dependencies = [
   "pywin32>=311; sys_platform == 'win32'",
 ]
 
+[dependency-groups]
+dev = [
+  "ruff>=0.17",
+]
+
 [tool.pyright]
 pythonVersion = "3.14"
 typeCheckingMode = "standard"
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+  "E",  # pycodestyle errors
+  "W",  # pycodestyle warnings
+  "F",  # Pyflakes
+  "I",  # isort
+  "UP",  # pyupgrade
+  "B",  # flake8-bugbear
+  "SIM",  # flake8-simplify
+  "ASYNC",  # flake8-async
+  "RUF",  # Ruff-specific rules
+]

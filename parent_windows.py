@@ -10,9 +10,9 @@ directly via ctypes and build the lpReserved2 buffer ourselves so that
 the child's CRT initialises fd 3 from our pipe handle.
 
 lpReserved2 format (MSVC CRT _ioinit):
-    DWORD  nCount          – number of entries
-    BYTE   flags[nCount]   – FOPEN=0x01, FPIPE=0x08 per fd
-    HANDLE handles[nCount] – one HANDLE per fd (8 bytes on 64-bit)
+    DWORD  nCount          - number of entries
+    BYTE   flags[nCount]   - FOPEN=0x01, FPIPE=0x08 per fd
+    HANDLE handles[nCount] - one HANDLE per fd (8 bytes on 64-bit)
 
 The parent end of the pipe is driven by asyncio: the child inherits the
 server end, and the parent connects as the client through the
@@ -20,6 +20,7 @@ ProactorEventLoop (the default event loop on Windows).
 """
 
 import asyncio
+import contextlib
 import ctypes
 import ctypes.wintypes as wintypes
 import json
@@ -138,7 +139,7 @@ def _build_lpReserved2(ipc_handle: int) -> bytes:
     return buf
 
 
-def _make_env_block(env: dict[str, str]) -> "ctypes.Array[ctypes.c_wchar]":
+def _make_env_block(env: dict[str, str]) -> ctypes.Array[ctypes.c_wchar]:
     """Build a Unicode, double-null-terminated environment block."""
     block = "".join(f"{k}={v}\0" for k, v in env.items()) + "\0"
     return ctypes.create_unicode_buffer(block)
@@ -285,7 +286,7 @@ class NodeIPCProcess:
             env["NODE_CHANNEL_SERIALIZATION_MODE"] = "json"
 
             # Build command line (quote tokens that contain spaces)
-            parts = ["node", self.script_path] + self.args
+            parts = ["node", self.script_path, *self.args]
             cmd   = " ".join(f'"{p}"' if (" " in p or not p) else p for p in parts)
 
             try:
@@ -307,10 +308,8 @@ class NodeIPCProcess:
         self._proc.terminate()
         await self._proc.wait()
         self._writer.close()
-        try:
+        with contextlib.suppress(ConnectionError):
             await self._writer.wait_closed()
-        except ConnectionError:
-            pass
 
     async def wait(self) -> int:
         """Wait for the child to exit and return its exit code."""
@@ -336,10 +335,10 @@ class NodeIPCProcess:
         """Send a message to the Node child wrapped in a libuv IPC frame.
 
         libuv IPC frame layout (uv__ipc_frame_header_t, 16 bytes):
-            uint32_t flags        – UV__IPC_FRAME_HAS_DATA = 0x01
-            uint32_t reserved1    – 0
-            uint32_t data_length  – byte length of the payload
-            uint32_t reserved2    – 0
+            uint32_t flags        - UV__IPC_FRAME_HAS_DATA = 0x01
+            uint32_t reserved1    - 0
+            uint32_t data_length  - byte length of the payload
+            uint32_t reserved2    - 0
         Immediately followed by data_length bytes of payload.
         """
         data   = (json.dumps(message) + "\n").encode()
