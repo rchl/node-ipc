@@ -13,22 +13,25 @@ lpReserved2 format (MSVC CRT _ioinit):
     DWORD  nCount          – number of entries
     BYTE   flags[nCount]   – FOPEN=0x01, FPIPE=0x08 per fd
     HANDLE handles[nCount] – one HANDLE per fd (8 bytes on 64-bit)
+
+The parent end of the pipe is driven by asyncio: the child inherits the
+server end, and the parent connects as the client through the
+ProactorEventLoop (the default event loop on Windows).
 """
 
+import asyncio
 import ctypes
 import ctypes.wintypes as wintypes
 import json
 import os
 import struct
 import sys
-import threading
 import uuid
-from collections.abc import Callable
-from typing import final
+from collections.abc import AsyncIterator
+from types import TracebackType
+from typing import Self, final
 
 import pywintypes
-import win32api
-import win32event
 import win32file
 import win32pipe
 
@@ -42,22 +45,37 @@ FPIPE              = 0x08
 STARTF_USESTDHANDLES        = 0x00000100
 CREATE_UNICODE_ENVIRONMENT  = 0x00000400
 HANDLE_FLAG_INHERIT         = 0x00000001
+FILE_FLAG_FIRST_PIPE_INSTANCE = 0x00080000
 INFINITE                    = 0xFFFFFFFF
 STD_INPUT_HANDLE            = wintypes.DWORD(-10)
 STD_OUTPUT_HANDLE           = wintypes.DWORD(-11)
 STD_ERROR_HANDLE            = wintypes.DWORD(-12)
 INVALID_HANDLE_VALUE        = wintypes.HANDLE(-1).value
 
+# libuv IPC frame layout (uv__ipc_frame_header_t + optional socket xfer + data):
+#     [16-byte header: flags u32, reserved u32, data_length u32, reserved u32]
+#     [632-byte socket-xfer block]  ← only if flags & 0x02
+#     [data_length bytes payload]   ← only if flags & 0x01
+IPC_HEADER_SIZE      = 16
+IPC_SOCKET_XFER_SIZE = 632
+IPC_HAS_DATA         = 0x01
+IPC_HAS_SOCKET_XFER  = 0x02
+
 # -----------------------------------------------------------------------
 # ctypes declarations
 # -----------------------------------------------------------------------
-kernel32 = ctypes.windll.kernel32
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 kernel32.GetStdHandle.restype       = wintypes.HANDLE
 kernel32.GetStdHandle.argtypes      = [wintypes.DWORD]
 kernel32.CreateProcessW.restype     = wintypes.BOOL
 kernel32.TerminateProcess.restype   = wintypes.BOOL
+kernel32.TerminateProcess.argtypes  = [wintypes.HANDLE, wintypes.UINT]
 kernel32.WaitForSingleObject.restype = wintypes.DWORD
+kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
 kernel32.CloseHandle.restype        = wintypes.BOOL
+kernel32.CloseHandle.argtypes       = [wintypes.HANDLE]
 kernel32.SetHandleInformation.restype = wintypes.BOOL
 
 
@@ -93,10 +111,6 @@ class PROCESS_INFORMATION(ctypes.Structure):
     ]
 
 
-class ServerStoppedError(Exception):
-    pass
-
-
 # -----------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------
@@ -107,7 +121,7 @@ def _build_lpReserved2(ipc_handle: int) -> bytes:
 
     We put 4 entries (fds 0-3):
       - fds 0-2: flag=0 so the CRT skips them; they come from hStdInput/Output/Error
-      - fd 3:    FOPEN|FPIPE with our named-pipe client handle
+      - fd 3:    FOPEN|FPIPE with our named-pipe handle
     """
     n          = 4
     handle_sz  = ctypes.sizeof(ctypes.c_void_p)   # 8 on 64-bit Windows
@@ -182,20 +196,29 @@ def _spawn_node(cmd: str, env: dict[str, str], ipc_handle: int) -> tuple[int, in
 
 
 class _ProcHandle:
-    """Minimal process wrapper backed by a Win32 HANDLE."""
+    """Minimal asyncio-friendly process wrapper backed by a Win32 HANDLE."""
 
     def __init__(self, hProcess: int, pid: int) -> None:
         self._handle = hProcess
         self.pid     = pid
+        self.returncode: int | None = None
+        self._waiter: asyncio.Task[int] | None = None
 
-    def wait(self) -> None:
-        if self._handle:
-            kernel32.WaitForSingleObject(self._handle, INFINITE)
-            kernel32.CloseHandle(self._handle)
-            self._handle = None
+    async def wait(self) -> int:
+        if self._waiter is None:
+            self._waiter = asyncio.create_task(self._wait())
+        return await asyncio.shield(self._waiter)
+
+    async def _wait(self) -> int:
+        await asyncio.to_thread(kernel32.WaitForSingleObject, self._handle, INFINITE)
+        code = wintypes.DWORD()
+        kernel32.GetExitCodeProcess(self._handle, ctypes.byref(code))
+        kernel32.CloseHandle(self._handle)
+        self.returncode = code.value
+        return code.value
 
     def terminate(self) -> None:
-        if self._handle:
+        if self.returncode is None:
             kernel32.TerminateProcess(self._handle, 1)
 
 
@@ -205,100 +228,111 @@ class _ProcHandle:
 
 @final
 class NodeIPCProcess:
+    """
+    Spawns a Node.js child process with an IPC channel,
+    mimicking what Node's child_process.fork() sets up.
+
+        async with NodeIPCProcess("child.js") as proc:
+            await proc.send({"type": "ping"})
+            async for message in proc:
+                ...
+    """
+
+    _proc: _ProcHandle | None = None
+    _reader: asyncio.StreamReader
+    _writer: asyncio.StreamWriter
 
     def __init__(self, script_path: str, args: list[str] | None = None):
         self.script_path = script_path
         self.args        = args or []
-        self._proc: _ProcHandle | None = None
-        self._server_handle = None
-        self._message_handlers: list[Callable[[dict[str, object]], None]] = []
-        self._reader_thread: threading.Thread | None = None
-        self._lock = threading.Lock()
+        self._buffer     = b""
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def start(self) -> "NodeIPCProcess":
-        pipe_name = f"\\\\.\\pipe\\node-ipc-{uuid.uuid4().hex}"
-        cur_proc  = win32api.GetCurrentProcess()
+    async def start(self) -> Self:
+        loop = asyncio.get_running_loop()
+        if not isinstance(loop, asyncio.ProactorEventLoop):
+            raise RuntimeError("NodeIPCProcess requires the ProactorEventLoop")
 
+        pipe_name = f"\\\\.\\pipe\\node-ipc-{uuid.uuid4().hex}"
+
+        # Server end goes to the child, so create it inheritable.
+        # FILE_FLAG_OVERLAPPED is required to match libuv's async I/O.
         sa = pywintypes.SECURITY_ATTRIBUTES()
-        # Server end — FILE_FLAG_OVERLAPPED required to match libuv's async I/O
-        self._server_handle = win32pipe.CreateNamedPipe(
+        sa.bInheritHandle = True
+        server_handle = win32pipe.CreateNamedPipe(
             pipe_name,
-            win32pipe.PIPE_ACCESS_DUPLEX | win32file.FILE_FLAG_OVERLAPPED,
+            win32pipe.PIPE_ACCESS_DUPLEX | win32file.FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
             win32pipe.PIPE_TYPE_BYTE | win32pipe.PIPE_READMODE_BYTE | win32pipe.PIPE_WAIT,
             1,          # nMaxInstances
             PIPE_BUFFER,
             PIPE_BUFFER,
             0,
-            sa,       # non-inheritable
+            sa,
         )
-
-        # Put server into listening state (overlapped → doesn't block)
-        connect_ov = pywintypes.OVERLAPPED()
-        connect_ov.hEvent = win32event.CreateEvent(None, True, False, None)
         try:
-            win32pipe.ConnectNamedPipe(self._server_handle, connect_ov)
-        except pywintypes.error as e:
-            if e.winerror != 997:   # ERROR_IO_PENDING is expected
+            # Connect our end as the client through the proactor.
+            self._reader = asyncio.StreamReader()
+            transport, protocol = await loop.create_pipe_connection(
+                lambda: asyncio.StreamReaderProtocol(self._reader), pipe_name,
+            )
+            self._writer = asyncio.StreamWriter(transport, protocol, self._reader, loop)
+
+            env = os.environ.copy()
+            env["NODE_CHANNEL_FD"] = "3"        # CRT fd 3 — set via lpReserved2
+            env["NODE_CHANNEL_SERIALIZATION_MODE"] = "json"
+
+            # Build command line (quote tokens that contain spaces)
+            parts = ["node", self.script_path] + self.args
+            cmd   = " ".join(f'"{p}"' if (" " in p or not p) else p for p in parts)
+
+            try:
+                hProcess, pid = _spawn_node(cmd, env, int(server_handle))
+            except BaseException:
+                self._writer.close()
                 raise
+        finally:
+            # The child has inherited its own copy of the server handle
+            win32file.CloseHandle(server_handle)
 
-        # Client end — non-inheritable first, then duplicate as inheritable
-        client_handle = win32file.CreateFile(
-            pipe_name,
-            win32file.GENERIC_READ | win32file.GENERIC_WRITE,
-            0,
-            None,
-            win32file.OPEN_EXISTING,
-            win32file.FILE_FLAG_OVERLAPPED,
-            None,
-        )
-        inheritable_client_ipc_handle = win32api.DuplicateHandle(
-            cur_proc, client_handle.handle, cur_proc,
-            0,
-            True,   # bInheritHandle
-            2,      # DUPLICATE_SAME_ACCESS
-        )
-        win32file.CloseHandle(client_handle.handle)
-
-        # Wait for ConnectNamedPipe to complete (client CreateFile already triggered it)
-        win32event.WaitForSingleObject(connect_ov.hEvent, win32event.INFINITE)
-
-        env = os.environ.copy()
-        env["NODE_CHANNEL_FD"] = "3"        # CRT fd 3 — set via lpReserved2 below
-        env["NODE_CHANNEL_SERIALIZATION_MODE"] = "json"
-
-        # Build command line (quote tokens that contain spaces)
-        parts = ["node", self.script_path] + self.args
-        cmd   = " ".join(f'"{p}"' if (" " in p or not p) else p for p in parts)
-
-        hProcess, _pid = _spawn_node(cmd, env, int(inheritable_client_ipc_handle))  # ipc_handle is technically a PyHANDLE
-
-        # Child has inherited its copy of the handle — close the parent's copy
-        win32file.CloseHandle(inheritable_client_ipc_handle)
-
-        self._proc = _ProcHandle(hProcess, _pid)
-
-        self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
-        self._reader_thread.start()
-
+        self._proc = _ProcHandle(hProcess, pid)
         return self
 
-    def stop(self) -> None:
-        if self._proc:
-            self._proc.terminate()
-            self._proc.wait()
-        if self._server_handle:
-            win32file.CloseHandle(self._server_handle)
-            self._server_handle = None
+    async def close(self) -> None:
+        """Terminate the child if it is still running and close the channel."""
+        if not self._proc:
+            return
+        self._proc.terminate()
+        await self._proc.wait()
+        self._writer.close()
+        try:
+            await self._writer.wait_closed()
+        except ConnectionError:
+            pass
+
+    async def wait(self) -> int:
+        """Wait for the child to exit and return its exit code."""
+        assert self._proc, "process not started"
+        return await self._proc.wait()
+
+    async def __aenter__(self) -> Self:
+        return await self.start()
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        await self.close()
 
     # ------------------------------------------------------------------
     # Messaging
     # ------------------------------------------------------------------
 
-    def send(self, message: dict) -> None:
+    async def send(self, message: dict[str, object]) -> None:
         """Send a message to the Node child wrapped in a libuv IPC frame.
 
         libuv IPC frame layout (uv__ipc_frame_header_t, 16 bytes):
@@ -308,113 +342,48 @@ class NodeIPCProcess:
             uint32_t reserved2    – 0
         Immediately followed by data_length bytes of payload.
         """
-        data    = (json.dumps(message) + "\n").encode()
-        header  = struct.pack("<IIII", 0x01, 0, len(data), 0)
-        payload = header + data
-        ov = pywintypes.OVERLAPPED()
-        ov.hEvent = win32event.CreateEvent(None, True, False, None)
-        with self._lock:
-            if not self._server_handle:
-                raise ServerStoppedError
+        data   = (json.dumps(message) + "\n").encode()
+        header = struct.pack("<IIII", IPC_HAS_DATA, 0, len(data), 0)
+        self._writer.write(header + data)
+        await self._writer.drain()
+
+    async def receive(self) -> dict[str, object]:
+        """Wait for the next message from Node. Raises EOFError once the channel closes."""
+        while True:
+            line, sep, rest = self._buffer.partition(b"\n")
+            if not sep:
+                self._buffer += await self._read_frame()
+                continue
+            self._buffer = rest
+            line = line.strip()
+            if not line:
+                continue
             try:
-                rc, _ = win32file.WriteFile(self._server_handle, payload, ov)
-                if rc != 0:
-                    win32event.WaitForSingleObject(ov.hEvent, win32event.INFINITE)
-            except pywintypes.error as e:
-                if e.winerror == 997:   # ERROR_IO_PENDING
-                    win32event.WaitForSingleObject(ov.hEvent, win32event.INFINITE)
-                else:
-                    raise
+                return json.loads(line)
+            except json.JSONDecodeError:
+                print(f"[IPC] bad JSON from Node: {line!r}", file=sys.stderr)
 
-    def on_message(self, handler: Callable[[dict], None]) -> "NodeIPCProcess":
-        self._message_handlers.append(handler)
-        return self
-
-    def wait(self) -> None:
-        if self._proc:
-            self._proc.wait()
+    async def __aiter__(self) -> AsyncIterator[dict[str, object]]:
+        """Iterate over messages from Node until the channel closes."""
+        while True:
+            try:
+                yield await self.receive()
+            except EOFError:
+                return
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 
-    def _read_loop(self) -> None:
-        """Read libuv IPC frames from the server handle and dispatch messages.
-
-        Frame layout (matches uv__ipc_frame_header_t + optional socket xfer + data):
-            [16-byte header: flags u32, reserved u32, data_length u32, reserved u32]
-            [632-byte socket-xfer block]  ← only if flags & 0x02
-            [data_length bytes payload]   ← only if flags & 0x01
-        """
-        IPC_HEADER_SIZE     = 16
-        IPC_SOCKET_XFER_SIZE = 632
-        IPC_HAS_DATA        = 0x01
-        IPC_HAS_SOCKET_XFER = 0x02
-
-        buf = b""
+    async def _read_frame(self) -> bytes:
+        """Read one libuv IPC frame and return its payload."""
         try:
-            while True:
-                read_buf = win32file.AllocateReadBuffer(PIPE_BUFFER)
-                ov = pywintypes.OVERLAPPED()
-                ov.hEvent = win32event.CreateEvent(None, True, False, None)
-
-                try:
-                    if not self._server_handle:
-                        raise ServerStoppedError
-                    win32file.ReadFile(self._server_handle, read_buf, ov)
-                    # Synchronous completion — event is signaled, fall through to wait
-                except pywintypes.error as e:
-                    if e.winerror == 997:   # ERROR_IO_PENDING — normal for overlapped
-                        pass
-                    elif e.winerror in (109, 232):   # pipe broken / closing
-                        break
-                    else:
-                        raise
-
-                # Always wait: handles both the sync-but-still-signaled and async cases
-                win32event.WaitForSingleObject(ov.hEvent, win32event.INFINITE)
-
-                try:
-                    if not self._server_handle:
-                        raise ServerStoppedError
-                    n = win32file.GetOverlappedResult(self._server_handle, ov, False)
-                except pywintypes.error as e:
-                    if e.winerror in (109, 232):
-                        break
-                    raise
-
-                if n == 0:
-                    continue
-                buf += bytes(read_buf[:n])
-
-                # Parse complete IPC frames out of the buffer
-                while len(buf) >= IPC_HEADER_SIZE:
-                    flags, _r1, data_length, _r2 = struct.unpack_from("<IIII", buf)
-
-                    # Compute total frame size so we know when we have enough bytes
-                    frame_size = IPC_HEADER_SIZE
-                    if flags & IPC_HAS_SOCKET_XFER:
-                        frame_size += IPC_SOCKET_XFER_SIZE
-                    if flags & IPC_HAS_DATA:
-                        frame_size += data_length
-
-                    if len(buf) < frame_size:
-                        break   # wait for more bytes
-
-                    # Extract payload (skip socket-xfer block if present)
-                    if flags & IPC_HAS_DATA:
-                        data_start = IPC_HEADER_SIZE + (IPC_SOCKET_XFER_SIZE if flags & IPC_HAS_SOCKET_XFER else 0)
-                        data = buf[data_start : data_start + data_length]
-                        line = data.strip()
-                        if line:
-                            try:
-                                msg = json.loads(line)
-                            except json.JSONDecodeError:
-                                print(f"[IPC] bad JSON from Node: {line!r}", file=sys.stderr)
-                            else:
-                                for handler in self._message_handlers:
-                                    handler(msg)
-
-                    buf = buf[frame_size:]
-        except Exception as exc:
-            print(f"[IPC] reader error: {exc}", file=sys.stderr)
+            header = await self._reader.readexactly(IPC_HEADER_SIZE)
+            flags, _r1, data_length, _r2 = struct.unpack("<IIII", header)
+            if flags & IPC_HAS_SOCKET_XFER:
+                await self._reader.readexactly(IPC_SOCKET_XFER_SIZE)
+            if flags & IPC_HAS_DATA:
+                return await self._reader.readexactly(data_length)
+            return b""
+        except asyncio.IncompleteReadError as e:
+            raise EOFError("IPC channel closed") from e
