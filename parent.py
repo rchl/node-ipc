@@ -73,7 +73,7 @@ class NodeIPCProcess:
         self._proc = subprocess.Popen(
             ["node", self.script_path] + self.args,
             pass_fds=(child_fd,),   # fd 3 is now explicitly passed through
-            stdin=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
             stdout=sys.stdout,
             stderr=sys.stderr,
             env=env,
@@ -97,6 +97,15 @@ class NodeIPCProcess:
         if self._proc:
             self._proc.terminate()
             self._proc.wait()
+            # Shut down first so the reader thread sees EOF before we close
+            try:
+                self._ipc_sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            if self._reader_thread:
+                self._reader_thread.join(timeout=1)
+            self._ipc_file.close()
+            self._ipc_sock.close()
 
     # ------------------------------------------------------------------
     # Messaging
