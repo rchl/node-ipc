@@ -4,6 +4,9 @@ function main() {
         if (message && message.type === 'exit') {
             process.exit(0)
         }
+        if (message && message.type === 'echo') {
+            process.send(message)
+        }
     })
 
     process.on('disconnect', () => {

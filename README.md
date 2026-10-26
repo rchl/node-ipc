@@ -77,7 +77,6 @@ This needs the `ProactorEventLoop`, which is asyncio's default on Windows. `star
 
 - **JSON only:** messages must be JSON-serializable. Node's `advanced` serialization mode isn't supported.
 - **No handle passing:** sending sockets or servers with `process.send(message, handle)` isn't supported.
-- **64 KiB message limit on Linux and macOS:** a message from the child larger than 64 KiB makes `receive()` raise `ValueError`, because that's the default line length limit of asyncio streams. Windows has no such limit.
 
 ## Files
 
@@ -85,10 +84,10 @@ This needs the `ProactorEventLoop`, which is asyncio's default on Windows. `star
 |---|---|
 | `parent.py` | Python parent for Linux and macOS |
 | `parent_windows.py` | Python parent for Windows |
-| `child.js` | Example child. It sends a `hello` message after 2 seconds, logs what it receives, and exits on `{"type": "exit"}` or when the channel closes. |
+| `child.js` | Example child. It sends a `hello` message after 2 seconds, logs what it receives, sends back any `{"type": "echo"}` message, and exits on `{"type": "exit"}` or when the channel closes. |
 | `debug.js` | Diagnostic child. It prints the IPC environment it sees, then sends one test message, retrying if the send fails. Use it in place of `child.js` when the channel doesn't come up. |
 | `parent.ts` | Node-to-Node reference that forks `child.js` with `child_process.fork()`. Run it with `npm install` then `npm run run`. It doesn't exit on its own, so stop it with Ctrl+C. |
-| `test_ipc.py` | End-to-end test |
+| `test_ipc.py` | End-to-end tests |
 
 ## Testing
 
@@ -96,9 +95,14 @@ This needs the `ProactorEventLoop`, which is asyncio's default on Windows. `star
 uv run python test_ipc.py -v
 ```
 
-The test starts `child.js` and waits for its `hello` message. It then sends some pings and an `exit` message, and checks that the child exits with code 0 and that the channel closes. The whole test, including cleanup, has a 15-second timeout.
+The tests run against `child.js`:
 
-CI (`.github/workflows/test.yml`) runs the test on Linux, macOS and Windows with Node 20, 22 and 24. A final `test-result` job passes only if every run passed, and merging into `main` requires that check.
+- **Round trip:** waits for the child's `hello` message, then sends some pings and an `exit` message, and checks that the child exits with code 0 and that the channel closes.
+- **Large message:** sends a 1 MB message and checks that the child echoes it back intact.
+
+Each test, including cleanup, has a 15-second timeout.
+
+CI (`.github/workflows/test.yml`) runs the tests on Linux, macOS and Windows with Node 20, 22 and 24. A final `test-result` job passes only if every run passed, and merging into `main` requires that check.
 
 ## Linting and type checking
 

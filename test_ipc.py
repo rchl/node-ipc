@@ -36,6 +36,19 @@ class NodeIPCTest(unittest.IsolatedAsyncioTestCase):
             # Channel is closed once the child is gone.
             self.assertEqual([msg async for msg in proc], [])
 
+    async def test_large_message(self) -> None:
+        # Well above asyncio's 64 KiB default line limit and the pipe buffer size.
+        data = "x" * (1024 * 1024)
+        async with asyncio.timeout(TIMEOUT), NodeIPCProcess(CHILD_SCRIPT) as proc:
+            await proc.send({"type": "echo", "data": data})
+            # The child's hello may arrive before or after the echo.
+            async for msg in proc:
+                if msg["type"] == "echo":
+                    break
+            else:
+                self.fail("no echo from child")
+            self.assertEqual(msg["data"], data)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -14,6 +14,8 @@ from collections.abc import AsyncIterator
 from types import TracebackType
 from typing import Self, final
 
+READ_CHUNK_SIZE = 65536
+
 
 @final
 class NodeIPCProcess:
@@ -34,6 +36,8 @@ class NodeIPCProcess:
     def __init__(self, script_path: str, args: list[str] | None = None):
         self.script_path = script_path
         self.args = args or []
+        self._buffer = bytearray()
+        self._scanned = 0  # bytes of _buffer already searched for a newline
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -109,10 +113,7 @@ class NodeIPCProcess:
     async def receive(self) -> dict[str, object]:
         """Wait for the next message from Node. Raises EOFError once the channel closes."""
         while True:
-            line = await self._reader.readline()
-            if not line:
-                raise EOFError("IPC channel closed")
-            line = line.strip()
+            line = (await self._read_line()).strip()
             if not line:
                 continue
             try:
@@ -127,3 +128,24 @@ class NodeIPCProcess:
                 yield await self.receive()
             except EOFError:
                 return
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    async def _read_line(self) -> bytes:
+        """Return the next line from Node without its newline.
+
+        Unlike StreamReader.readline() this has no length limit, as Node
+        puts no limit on message size.
+        """
+        while (end := self._buffer.find(b"\n", self._scanned)) < 0:
+            self._scanned = len(self._buffer)
+            chunk = await self._reader.read(READ_CHUNK_SIZE)
+            if not chunk:
+                raise EOFError("IPC channel closed")
+            self._buffer += chunk
+        line = bytes(self._buffer[:end])
+        del self._buffer[: end + 1]
+        self._scanned = 0
+        return line
