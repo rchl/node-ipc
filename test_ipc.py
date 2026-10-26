@@ -21,7 +21,8 @@ TIMEOUT = 15
 class NodeIPCTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_round_trip(self) -> None:
-        async with NodeIPCProcess(CHILD_SCRIPT) as proc, asyncio.timeout(TIMEOUT):
+        # Timeout is outermost so it also covers the cleanup in __aexit__.
+        async with asyncio.timeout(TIMEOUT), NodeIPCProcess(CHILD_SCRIPT) as proc:
             # Node -> Python: child sends a hello message after startup.
             self.assertEqual(await proc.receive(), {"type": "hello", "text": "message from child"})
 
