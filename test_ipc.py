@@ -43,6 +43,18 @@ class NodeIPCTest(unittest.IsolatedAsyncioTestCase):
                 self.fail("no echo from child")
             self.assertEqual(msg["data"], data)
 
+    async def test_arguments(self) -> None:
+        # Each needs quoting or escaping on the Windows command line.
+        args = ["with space", 'with "quotes"', "trailing backslash\\", "tab\there", ""]
+        async with asyncio.timeout(TIMEOUT), NodeIPCProcess(CHILD_SCRIPT, args) as proc:
+            await proc.send({"type": "argv"})
+            async for msg in proc:
+                if msg["type"] == "argv":
+                    break
+            else:
+                self.fail("no argv from child")
+            self.assertEqual(msg["argv"], args)
+
 
 if __name__ == "__main__":
     unittest.main()

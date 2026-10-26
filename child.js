@@ -7,6 +7,9 @@ function main() {
         if (message && message.type === 'echo') {
             process.send(message)
         }
+        if (message && message.type === 'argv') {
+            process.send({ type: 'argv', argv: process.argv.slice(2) })
+        }
     })
 
     process.on('disconnect', () => {
